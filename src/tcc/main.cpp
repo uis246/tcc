@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstdint>
 #include <cinttypes>
+#include <memory.h>
 #include <span>
 #include <set>
 #include <algorithm>
@@ -14,6 +15,29 @@ typedef png_color color_t;
 constexpr inline bool operator ==(const color_t &a, const color_t &b) {
 	return a.red == b.red && a.green == b.green && a.blue == b.blue;
 }
+
+constexpr inline v2i32 operator +(const v2i32 &a, const v2i32 &b) {
+	return {a.x + b.x, a.y + b.y};
+}
+
+constexpr inline v2i32 operator -(const v2i32 &a, const v2i32 &b) {
+	return {a.x - b.x, a.y - b.y};
+}
+
+constexpr inline bool operator <(const v2i32 &a, const v2i32 &b) {
+	return a.x < b.x && a.y < b.y;
+}
+constexpr inline bool operator >(const v2i32 &a, const v2i32 &b) {
+	return a.x > b.x && a.y > b.y;
+}
+
+constexpr inline v2i32 minel(const v2i32 &a, const v2i32 &b) {
+	return {a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y};
+}
+constexpr inline v2i32 maxel(const v2i32 &a, const v2i32 &b) {
+	return {a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y};
+}
+
 
 //Get palette-to-palette table
 //Output plt color 0 is transparent
@@ -55,6 +79,8 @@ static png_bytep readPNG(mappedpng &png) {
 	png_bytepp rows = (png_bytepp)alloca(png.y * sizeof(png_bytepp));
 	size_t stride = png.colorType == PNG_COLOR_TYPE_RGB ? 3 : (png.colorType == PNG_COLOR_TYPE_PALETTE ? 1 : 4);
 	png_bytep data = (png_bytep)malloc(png.x * png.y * stride);
+	if(!data)
+		abort();
 	size_t offset = 0;
 	for(png_uint_32 i = 0; i < png.y; i++) {
 		rows[i] = data + offset;
@@ -139,13 +165,12 @@ void compile(int argc, const char * const *argv) {
 	}
 
 	//Read palette
-	//
 	std::vector<color_t> palette;
 	readPalette(palette_file, palette);
 
 	//Read input, palletize and write output
 	mappedpng input = map(input_file);
-	png_bytep data;
+	png_bytep data = nullptr;
 	if(input.colorType == PNG_COLOR_TYPE_PALETTE) {
 		std::vector<uint8_t> pltpair =
 				plt2pltTable(std::span<color_t>(input.paletted.plt, input.paletted.numcolors), std::span<const uint8_t>(input.paletted.alpha, input.paletted.numtransparent), palette, false);
@@ -157,6 +182,8 @@ void compile(int argc, const char * const *argv) {
 		png_bytep indata = readPNG(input);
 		size_t offset = 0, size = input.x * input.y;
 		data = (png_bytep)malloc(size);
+		if(!data)
+			abort();
 		size *= 4;
 		for(size_t i = 0; offset < size; offset += 4, i++) {
 			const color_t color{indata[offset], indata[offset + 1], indata[offset + 2]};
@@ -218,17 +245,152 @@ void compile(int argc, const char * const *argv) {
 	}
 
 	usage:
-	std::cout << "Compile tool usage: OUTPUT INPUT PALETTE OFFSETX OFFSETY\n";
+	std::cout << "Compile tool usage: OUTPUT INPUT PALETTE OFFSETX OFFSETY" << std::endl;
 	return;
 
 	overrange:
-	std::cout << "Offset is too big\n";
+	std::cout << "Offset is too big" << std::endl;
 	return;
 }
 
+struct activemapping {
+	mappedpng *png;
+	png_bytep pixels;
+	v2i32 brc;
+	bool collides;
+	constexpr bool operator <(const activemapping &b) const {
+		return png->offset.y < b.png->offset.y/* || (png->offset.y == b.png->offset.y && png->offset.x < b.png->offset.x)*/;
+	}
+};
+
 void link(int argc, char **argv) {
+	if(argc < 3)
+		goto usage;
+	{
+//	std::vector<char*> input_paths(argv + 1, argv + argc - 1);
+	std::vector<mappedpng> inputs;
+	std::vector<activemapping> ams;
+	inputs.reserve(argc - 1);
+	ams.reserve(argc - 1);
+	v2i32 min, max;
+	std::vector<color_t> wpalette;
+	for(int i = 0; i < argc - 1; i++) {
+		inputs.push_back(map(argv[i + 1]));
+		mappedpng &png = inputs[i];
+		if(png.colorType != PNG_COLOR_TYPE_PALETTE || png.paletted.numtransparent != 1 || png.paletted.alpha[0] != 0) {
+			std::cerr << "File " << argv[i + 1] << " does not seems to be compiled template" << std::endl;
+		}
+		std::vector<color_t> palette(png.paletted.plt, png.paletted.plt + (size_t)png.paletted.numcolors);
+		if(wpalette.empty()) {
+			wpalette = std::move(palette);
+		} else if(wpalette != palette) {
+			std::cerr << "Palette mismatch, recompile all images" << std::endl;
+			exit(-1);
+		}
+		min = minel(min, png.offset);
+		v2i32 brc = png.offset + v2i32{(png_int_32)png.x, (png_int_32)png.y};
+		max = maxel(max, brc);
+		activemapping am{&png, nullptr, brc, false};
+		for(int j = 0; j < i; j++) {
+			if(inputs[j].offset < brc && inputs[j].offset + v2i32{(png_int_32)inputs[j].x, (png_int_32)inputs[j].y} > png.offset) {
+				//Collision detected
+				am.collides = true;
+				ams[j].collides = true;
+			}
+		}
+		ams.push_back(am);
+	}
+	std::sort(ams.begin(), ams.end());
+
+	//Open write mapping
+	mappedpng output;
+	uint8_t zero = 0;
+	output.x = max.x - min.x;
+	output.y = max.y - min.y;
+	output.colorType = PNG_COLOR_TYPE_PALETTE;
+	output.bitDepth = 8;
+	output.offset.x = min.x;
+	output.offset.y = min.y;
+	output.write = true;
+	output.paletted.alpha = &zero;
+	output.paletted.numtransparent = 1;
+	output.paletted.plt = wpalette.data();
+	output.paletted.numcolors = wpalette.size();
+	mapwrite(argv[0], &output);
+	png_bytep out = (png_bytep)malloc(max.x - min.x);
+
+	for(png_int_32 y = min.y, base = 0, active = 0; y < max.y; y++) {
+		//Activate all mappins
+		for(png_int_32 i = base + active; i < argc - 1; i++)
+			if(ams[i].png->offset.y == y) {
+				ams[i].pixels = (png_bytep)malloc(ams[i].png->x);
+				if(ams[i].pixels == NULL) {
+					std::cerr << "Out of memory" << std::endl;
+					exit(-ENOMEM);
+				}
+				active++;
+			} else
+				break;
+		//Read rows
+		for(png_int_32 i = base; i < base + active; i++) {
+			png_read_row(ams[i].png->ptr, ams[i].pixels, NULL);
+		}
+		//Write row
+		for(png_int_32 x = min.x, xbase = base, xactive = 0;;) {
+			size_t odist = x - min.x;
+			if(xactive == 0) {
+				//Skip till next or end
+				if(xbase == active + base) {
+					//End line
+					//Set rest to 0
+					memset(out + odist, 0, max.x - x);
+					//Write line
+					png_write_row(output.ptr, out);
+					break;
+				} else {
+					//Some pngs left
+					memset(out + odist, 0, ams[xbase + xactive].png->offset.x - x);
+					x = ams[xbase + xactive].png->offset.x;
+					for(png_int_32 i = xbase + xactive; i < base + active; i++)
+						if(ams[i].png->offset.x == x) {
+							xactive++;
+						} else
+							break;
+				}
+			} else if(xactive == 1) {
+				//Write as much as possible
+				if(!ams[xbase].collides || xbase + xactive == base + active || ams[xbase].brc.x <= ams[xbase + 1].png->offset.x) {
+					//Write without checking
+					std::copy(ams[xbase].pixels + ams[xbase].png->offset.x - x, ams[xbase].pixels + ams[xbase].png->x, out + odist);
+					x = ams[xbase].brc.x;
+					xactive--;
+					xbase++;
+				}
+			} else {
+				//FIXME: not implemented
+				std::cerr << "Overlapping PNGs are not implemented yet" << std::endl;
+				exit(-ENOSYS);
+				//Write checking for conflicts
+			}
+		}
+		//Deactivate useless
+		for(png_int_32 i = base; i < base + active; i++)
+			if(ams[i].png->offset.y + (png_int_32)ams[i].png->y == y + 1) {
+				std::cout << "Freed " << i << std::endl;
+				free(ams[i].pixels);
+				unmap(ams[i].png);
+				active--;
+				base++;
+			} else
+				break;
+	}
+	free(out);
+	unmapwrite(output);
+	return;
+	}
+
 	usage:
-	std::cout << "Link tool usage: OUTPUT INPUT1 INPUT2...\n";
+	std::cout << "Link tool usage: OUTPUT INPUT1 INPUT2..." << std::endl;
 	return;
 }
 

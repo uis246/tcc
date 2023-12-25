@@ -46,9 +46,6 @@ struct mappedpng map(const char *path) {
 		goto fail;
 	}
 
-	png.x = png_get_image_width(png.ptr, png.info);
-	png.y = png_get_image_height(png.ptr, png.info);
-
 	if(png.colorType == PNG_COLOR_TYPE_PALETTE) {
 		png_uint_32 plt = png_get_PLTE(png.ptr, png.info, &png.paletted.plt, &png.paletted.numcolors);
 		plt = png_get_tRNS(png.ptr, png.info, &png.paletted.alpha, &png.paletted.numtransparent, NULL);
@@ -56,6 +53,14 @@ struct mappedpng map(const char *path) {
 			fprintf(stderr, "Image %s has palette color type, but no transparency\n", path);
 			goto fail;
 		}
+	}
+
+	png.x = png_get_image_width(png.ptr, png.info);
+	png.y = png_get_image_height(png.ptr, png.info);
+
+	if(png.x > INT32_MAX || png.y > INT32_MAX) {
+		fprintf(stderr, "Image %s is too big\n", path);
+		goto fail;
 	}
 
 	int unit_type;
