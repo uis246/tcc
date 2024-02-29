@@ -257,11 +257,73 @@ struct activemapping {
 	mappedpng *png;
 	png_bytep pixels;
 	v2i32 brc;
-	bool collides;
+//	bool collides;
 	constexpr bool operator <(const activemapping &b) const {
-		return png->offset.y < b.png->offset.y/* || (png->offset.y == b.png->offset.y && png->offset.x < b.png->offset.x)*/;
+		return png->offset.x < b.png->offset.x;
 	}
 };
+
+static constexpr bool operator <(const mappedpng &a, const mappedpng &b) {
+	return a.offset.y < b.offset.y;
+}
+
+thread_local png_bytep out;
+
+static void blendrow(const mappedpng &output, const std::span<const activemapping> ams) {
+	size_t active = ams.size(), xbase = 0;
+	for(png_int_32 x = output.offset.x, xactive = 0;;) {
+		size_t odist = x - output.offset.x;
+		if(xactive == 0) {
+			//Skip till next or end
+			if(xbase == active) {
+				//End line
+				//Set rest to 0
+				memset(out + odist, 0, output.offset.x + output.x - x);
+				//Write line
+				png_write_row(output.ptr, out);
+				break;
+			}
+		}
+		//Some pngs left
+		if(ams[xbase + xactive].png->offset.x != x) {
+			memset(out + odist, 0, ams[xbase + xactive].png->offset.x - x);
+			x = ams[xbase + xactive].png->offset.x;
+		}
+		for(size_t i = xbase + xactive; i < active; i++)
+			if(ams[i].png->offset.x == x) {
+				xactive++;
+			} else
+				break;
+		if(xactive == 1) {
+			//Write as much as possible
+			if(xbase + xactive == active || ams[xbase].brc.x <= ams[xbase + 1].png->offset.x) {
+				//Write entire image
+				std::copy(ams[xbase].pixels + ams[xbase].png->offset.x - x, ams[xbase].pixels + ams[xbase].png->x, out + odist);
+				x = ams[xbase].brc.x;
+				xactive--;
+				xbase++;
+			} else {
+				//Write partial image
+				std::copy(ams[xbase].pixels + ams[xbase].png->offset.x - x, ams[xbase].pixels + (ams[xbase + 1].png->offset.x - ams[xbase].png->offset.x), out + odist);
+				x = ams[xbase + 1].png->offset.x;
+			}
+		} else {
+			//FIXME: not implemented
+			std::cerr << "Overlapping PNGs are not implemented yet" << std::endl;
+			exit(-ENOSYS);
+			//Overwrite with last image for testing
+			std::copy(ams[xbase + xactive - 1].pixels + ams[xbase + xactive - 1].png->offset.x - x, ams[xbase + xactive - 1].pixels + (ams[xbase + xactive - 1].png->x), out + odist);
+			x = ams[xbase + xactive - 1].brc.x;
+			for(size_t i = xbase; i < active; i++)
+				if(ams[i].brc.x <= x) {
+					xbase++;
+					xactive--;
+				} else
+					break;
+			//Write checking for conflicts
+		}
+	}
+}
 
 void link(int argc, char **argv) {
 	if(argc < 3)
@@ -272,7 +334,7 @@ void link(int argc, char **argv) {
 	std::vector<activemapping> ams;
 	inputs.reserve(argc - 1);
 	ams.reserve(argc - 1);
-	v2i32 min, max;
+	v2i32 min(INT32_MAX, INT32_MAX), max(INT32_MIN, INT32_MIN);
 	std::vector<color_t> wpalette;
 	for(int i = 0; i < argc - 1; i++) {
 		inputs.push_back(map(argv[i + 1]));
@@ -290,17 +352,8 @@ void link(int argc, char **argv) {
 		min = minel(min, png.offset);
 		v2i32 brc = png.offset + v2i32{(png_int_32)png.x, (png_int_32)png.y};
 		max = maxel(max, brc);
-		activemapping am{&png, nullptr, brc, false};
-		for(int j = 0; j < i; j++) {
-			if(inputs[j].offset < brc && inputs[j].offset + v2i32{(png_int_32)inputs[j].x, (png_int_32)inputs[j].y} > png.offset) {
-				//Collision detected
-				am.collides = true;
-				ams[j].collides = true;
-			}
-		}
-		ams.push_back(am);
 	}
-	std::sort(ams.begin(), ams.end());
+	std::sort(inputs.begin(), inputs.end());
 
 	//Open write mapping
 	mappedpng output;
@@ -317,72 +370,47 @@ void link(int argc, char **argv) {
 	output.paletted.plt = wpalette.data();
 	output.paletted.numcolors = wpalette.size();
 	mapwrite(argv[0], &output);
-	png_bytep out = (png_bytep)malloc(max.x - min.x);
+	out = (png_bytep)malloc(max.x - min.x);
+	if(out == NULL) {
+		std::cerr << "Out of memory" << std::endl;
+		exit(-ENOMEM);
+	}
 
 	for(png_int_32 y = min.y, base = 0, active = 0; y < max.y; y++) {
+		bool dirty = false;
 		//Activate all mappins
 		for(png_int_32 i = base + active; i < argc - 1; i++)
-			if(ams[i].png->offset.y == y) {
-				ams[i].pixels = (png_bytep)malloc(ams[i].png->x);
-				if(ams[i].pixels == NULL) {
+			if(inputs[i].offset.y == y) {
+				mappedpng &png = inputs[i];
+				v2i32 brc = png.offset + v2i32{(png_int_32)png.x, (png_int_32)png.y};
+				activemapping am{&png, (png_bytep)malloc(png.x), brc};
+				if(am.pixels == NULL) {
 					std::cerr << "Out of memory" << std::endl;
 					exit(-ENOMEM);
 				}
+				ams.push_back(am);
 				active++;
+				dirty = true;
 			} else
 				break;
+		if(dirty)
+			std::sort(ams.begin(), ams.end());
 		//Read rows
-		for(png_int_32 i = base; i < base + active; i++) {
+		for(size_t i = 0; i < (size_t)active; i++) {
 			png_read_row(ams[i].png->ptr, ams[i].pixels, NULL);
 		}
 		//Write row
-		for(png_int_32 x = min.x, xbase = base, xactive = 0;;) {
-			size_t odist = x - min.x;
-			if(xactive == 0) {
-				//Skip till next or end
-				if(xbase == active + base) {
-					//End line
-					//Set rest to 0
-					memset(out + odist, 0, max.x - x);
-					//Write line
-					png_write_row(output.ptr, out);
-					break;
-				} else {
-					//Some pngs left
-					memset(out + odist, 0, ams[xbase + xactive].png->offset.x - x);
-					x = ams[xbase + xactive].png->offset.x;
-					for(png_int_32 i = xbase + xactive; i < base + active; i++)
-						if(ams[i].png->offset.x == x) {
-							xactive++;
-						} else
-							break;
-				}
-			} else if(xactive == 1) {
-				//Write as much as possible
-				if(!ams[xbase].collides || xbase + xactive == base + active || ams[xbase].brc.x <= ams[xbase + 1].png->offset.x) {
-					//Write without checking
-					std::copy(ams[xbase].pixels + ams[xbase].png->offset.x - x, ams[xbase].pixels + ams[xbase].png->x, out + odist);
-					x = ams[xbase].brc.x;
-					xactive--;
-					xbase++;
-				}
-			} else {
-				//FIXME: not implemented
-				std::cerr << "Overlapping PNGs are not implemented yet" << std::endl;
-				exit(-ENOSYS);
-				//Write checking for conflicts
-			}
-		}
+		blendrow(output, std::span<const activemapping>(ams));
 		//Deactivate useless
-		for(png_int_32 i = base; i < base + active; i++)
-			if(ams[i].png->offset.y + (png_int_32)ams[i].png->y == y + 1) {
-				std::cout << "Freed " << i << std::endl;
+		for(size_t i = 0; i < (size_t)active;) {
+			if(ams[i].brc.y - 1 == y) {
 				free(ams[i].pixels);
 				unmap(ams[i].png);
+				ams.erase(ams.begin() + i);
 				active--;
-				base++;
 			} else
-				break;
+				i++;
+		}
 	}
 	free(out);
 	unmapwrite(output);
