@@ -270,6 +270,7 @@ static constexpr bool operator <(const mappedpng &a, const mappedpng &b) {
 thread_local png_bytep out;
 
 static void blendrow(const mappedpng &output, const std::span<const activemapping> ams) {
+	//FIXME: current implementation assumes images will activate in same order they deactivate
 	size_t active = ams.size(), xbase = 0;
 	for(png_int_32 x = output.offset.x, xactive = 0;;) {
 		size_t odist = x - output.offset.x;
@@ -308,7 +309,7 @@ static void blendrow(const mappedpng &output, const std::span<const activemappin
 				x = ams[xbase + 1].png->offset.x;
 			}
 		} else {
-			//FIXME: not implemented
+			//TODO: not implemented
 			std::cerr << "Overlapping PNGs are not implemented yet" << std::endl;
 			exit(-ENOSYS);
 			//Overwrite with last image for testing
@@ -376,6 +377,7 @@ void link(int argc, char **argv) {
 		exit(-ENOMEM);
 	}
 
+	//FIXME: current implementation assumes images will activate in same order they deactivate
 	for(png_int_32 y = min.y, base = 0, active = 0; y < max.y; y++) {
 		bool dirty = false;
 		//Activate all mappins
